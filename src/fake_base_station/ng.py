@@ -215,6 +215,9 @@ class PCAPTrafficReplayer:
         from scapy.layers.inet import IP, UDP
         from scapy.layers.sctp import SCTP
         
+        NGAP_MARKER = b'ngap'
+        NGAP_MARKER_SEARCH_LIMIT = 16  # Search within first N bytes for the marker
+        
         self.ngap_messages = []
         base_time = None
         
@@ -228,21 +231,22 @@ class PCAPTrafficReplayer:
             
             relative_time = (timestamp - base_time) if timestamp and base_time else 0
             
-            # Try to extract payload from SCTP
-            if packet.haslayer(SCTP):
-                # SCTP payload is typically in Raw layer
-                if packet[SCTP].haslayer('Raw'):
-                    payload = bytes(packet[SCTP]['Raw'].load)
+            raw_data = None
             
-            # Try to extract payload from UDP
-            elif packet.haslayer(UDP):
-                if packet[UDP].haslayer('Raw'):
-                    payload = bytes(packet[UDP]['Raw'].load)
+            # Try to extract raw data from known layers first
+            if packet.haslayer(SCTP) and packet[SCTP].haslayer('Raw'):
+                raw_data = bytes(packet[SCTP]['Raw'].load)
+            elif packet.haslayer(UDP) and packet[UDP].haslayer('Raw'):
+                raw_data = bytes(packet[UDP]['Raw'].load)
+            elif packet.haslayer('Raw'):
+                raw_data = bytes(packet['Raw'].load)
             
-            # Try to extract from IP Raw (generic fallback)
-            elif packet.haslayer(IP):
-                if packet.haslayer('Raw'):
-                    payload = bytes(packet['Raw'].load)
+            # Detect NGAP by looking for 'ngap' marker near start of raw data
+            if raw_data:
+                marker_pos = raw_data.find(NGAP_MARKER, 0, NGAP_MARKER_SEARCH_LIMIT + len(NGAP_MARKER))
+                if marker_pos != -1:
+                    # NGAP PDU starts immediately after the 'ngap' marker
+                    payload = raw_data[marker_pos + len(NGAP_MARKER):]
             
             if payload:
                 src_ip = packet[IP].src if packet.haslayer(IP) else None
