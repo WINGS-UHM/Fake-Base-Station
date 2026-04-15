@@ -175,6 +175,44 @@ def print_decoded_structure(pdu):
     print(pdu)
 
 
+NGAP_SCTP_PORT = 38412
+NGAP_SCTP_PPID = 60  # Payload Protocol Identifier for NGAP (3GPP TS 38.412)
+
+
+def create_sctp_socket(host: str, port: int = NGAP_SCTP_PORT) -> socket.socket:
+    """
+    Create and connect an SCTP socket suitable for sending NGAP messages.
+    NGAP runs over SCTP on port 38412 (3GPP TS 38.412).
+
+    Requires OS-level SCTP support:
+      - Linux: install lksctp-tools (apt install lksctp-tools)
+      - Windows: not natively supported; use WSL or a third-party SCTP stack
+
+    Args:
+        host: Destination IP address of the AMF / 5G core
+        port: SCTP port (default 38412)
+
+    Returns:
+        socket.socket: Connected SCTP one-to-one (SOCK_STREAM) socket
+
+    Raises:
+        OSError: If SCTP is not supported on this OS
+    """
+    IPPROTO_SCTP = getattr(socket, 'IPPROTO_SCTP', 132)
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_SCTP)
+    except OSError as e:
+        raise OSError(
+            f"Failed to create SCTP socket: {e}\n"
+            "SCTP is not supported on this system. "
+            "On Linux install lksctp-tools; on Windows use WSL."
+        ) from e
+
+    sock.connect((host, port))
+    return sock
+
+
 class PCAPTrafficReplayer:
     """
     Load and replay NGAP traffic from a .pcap file.
@@ -498,7 +536,7 @@ class PCAPTrafficReplayer:
             if msg_idx > 0:
                 wait_time = (msg['relative_time'] - messages[msg_idx - 1]['relative_time']) / speed_factor
                 if wait_time > 0:
-                    time.sleep(wait_time)
+                    time.sleep(float(wait_time))
             
             # Send packet
             try:
@@ -540,6 +578,96 @@ class PCAPTrafficReplayer:
         
         return thread
     
+    def replay_to_sctp(self, host: str, port: int = NGAP_SCTP_PORT, speed_factor: float = 1.0,
+                       on_packet_sent: Optional[Callable[[int, bytes], None]] = None,
+                       stop_event: Optional[threading.Event] = None,
+                       packet_type: str = "ngap_only") -> None:
+        """
+        Replay captured NGAP packets over a new SCTP connection.
+        NGAP runs over SCTP on port 38412 per 3GPP TS 38.412.
+
+        Requires OS-level SCTP support (Linux with lksctp-tools; not natively
+        available on Windows — use WSL).
+
+        Args:
+            host: Destination IP address of the AMF / 5G core
+            port: SCTP port (default 38412)
+            speed_factor: Replay speed multiplier (1.0 = real-time)
+            on_packet_sent: Optional callback called with (index, payload) after each send
+            stop_event: Optional threading.Event to stop replay early
+            packet_type: "ngap_only" or "all"
+
+        Raises:
+            RuntimeError: If no messages to replay
+            ValueError: If packet_type is invalid
+            OSError: If SCTP is not supported on this OS
+        """
+        if packet_type not in ("ngap_only", "all"):
+            raise ValueError(f"packet_type must be 'ngap_only' or 'all', got '{packet_type}'")
+
+        messages = self.ngap_messages if packet_type == "ngap_only" else self._get_all_packet_payloads()
+
+        if not messages:
+            raise RuntimeError(f"No {packet_type} messages to replay")
+
+        sock = create_sctp_socket(host, port)
+
+        try:
+            print(f"Starting SCTP replay to {host}:{port} at {speed_factor}x speed ({packet_type})...")
+
+            for msg_idx, msg in enumerate(messages):
+                if stop_event and stop_event.is_set():
+                    print("Replay stopped by stop_event")
+                    break
+
+                if msg_idx > 0:
+                    wait_time = (msg['relative_time'] - messages[msg_idx - 1]['relative_time']) / speed_factor
+                    if wait_time > 0:
+                        time.sleep(float(wait_time))
+
+                try:
+                    sock.send(msg['payload'])
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    print(f"  [{msg_idx}] Connection closed: {e}")
+                    break
+
+                if on_packet_sent:
+                    on_packet_sent(msg_idx, msg['payload'])
+
+                print(f"  [{msg_idx}] Sent {len(msg['payload'])} bytes over SCTP")
+
+            print("SCTP replay complete")
+
+        finally:
+            sock.close()
+
+    def replay_sctp_threaded(self, host: str, port: int = NGAP_SCTP_PORT,
+                             speed_factor: float = 1.0,
+                             on_packet_sent: Optional[Callable[[int, bytes], None]] = None,
+                             packet_type: str = "ngap_only") -> threading.Thread:
+        """
+        Start SCTP replay in a background thread.
+
+        Args:
+            host: Destination IP address
+            port: SCTP port (default 38412)
+            speed_factor: Replay speed multiplier
+            on_packet_sent: Optional callback
+            packet_type: "ngap_only" or "all"
+
+        Returns:
+            threading.Thread: Started replay thread with a .stop_event attribute
+        """
+        stop_event = threading.Event()
+
+        def replay_worker():
+            self.replay_to_sctp(host, port, speed_factor, on_packet_sent, stop_event, packet_type)
+
+        thread = threading.Thread(target=replay_worker, daemon=False)
+        thread.stop_event = stop_event
+        thread.start()
+        return thread
+
     def get_timing_info(self) -> str:
         """
         Get timing information for all messages.
