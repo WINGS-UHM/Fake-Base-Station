@@ -209,7 +209,14 @@ def create_sctp_socket(host: str, port: int = NGAP_SCTP_PORT) -> socket.socket:
             "On Linux install lksctp-tools; on Windows use WSL."
         ) from e
 
-    sock.connect((host, port))
+    try:
+        sock.connect((host, port))
+    except ConnectionRefusedError:
+        sock.close()
+        raise ConnectionRefusedError(
+            f"Connection refused to {host}:{port}. "
+            "Make sure an AMF / 5G core is running and listening on that address and port."
+        )
     return sock
 
 
@@ -661,7 +668,10 @@ class PCAPTrafficReplayer:
         stop_event = threading.Event()
 
         def replay_worker():
-            self.replay_to_sctp(host, port, speed_factor, on_packet_sent, stop_event, packet_type)
+            try:
+                self.replay_to_sctp(host, port, speed_factor, on_packet_sent, stop_event, packet_type)
+            except Exception as e:
+                print(f"SCTP replay failed: {e}")
 
         thread = threading.Thread(target=replay_worker, daemon=False)
         thread.stop_event = stop_event
