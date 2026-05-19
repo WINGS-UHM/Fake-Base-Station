@@ -744,7 +744,7 @@ class UEGapGui:
     # ------------------------------------------------------------------
 
     def _open5gs_connect(self):
-        """Open SCTP connection to Open5GS AMF and send NGSetupRequest."""
+        """Open SCTP connection to Open5GS AMF and send NGSetupRequest (non-blocking)."""
         if not _OPEN5GS_AVAILABLE:
             detail = f"\n\nImport error:\n{_OPEN5GS_IMPORT_ERROR}" if _OPEN5GS_IMPORT_ERROR else ""
             messagebox.showerror(
@@ -759,20 +759,31 @@ class UEGapGui:
         try:
             amf_ip = self.amf_ip_var.get().strip()
             amf_port = int(self.amf_port_var.get().strip())
-            self._open5gs_conn = Open5GSConnection(
-                amf_host=amf_ip,
-                amf_port=amf_port,
-                on_message=self._open5gs_on_message,
-                on_status=self._open5gs_on_status,
-            )
-            ok = self._open5gs_conn.connect()
-            if ok:
-                self._update_open5gs_status("Connecting…", "orange")
-            else:
-                self._update_open5gs_status("Connection failed", "red")
-        except Exception as exc:
-            self._log(f"[Open5GS] Connect error: {exc}")
-            messagebox.showerror("Open5GS", str(exc))
+        except ValueError as exc:
+            messagebox.showerror("Open5GS", f"Invalid AMF port: {exc}")
+            return
+
+        self._update_open5gs_status("Connecting…", "orange")
+
+        def _connect_worker():
+            try:
+                conn = Open5GSConnection(
+                    amf_host=amf_ip,
+                    amf_port=amf_port,
+                    on_message=self._open5gs_on_message,
+                    on_status=self._open5gs_on_status,
+                )
+                ok = conn.connect()
+                self._open5gs_conn = conn
+                if not ok:
+                    self.root.after(0, lambda: self._update_open5gs_status("Connection failed", "red"))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: (
+                    self._log(f"[Open5GS] Connect error: {e}"),
+                    self._update_open5gs_status(f"Error: {e}", "red"),
+                ))
+
+        threading.Thread(target=_connect_worker, daemon=True, name="Open5GS-Connect").start()
 
     def _open5gs_disconnect(self):
         """Disconnect from Open5GS AMF."""

@@ -184,7 +184,7 @@ NGAP_SCTP_PORT = 38412
 NGAP_SCTP_PPID = 60  # Payload Protocol Identifier for NGAP (3GPP TS 38.412)
 
 
-def create_sctp_socket(host: str, port: int = NGAP_SCTP_PORT) -> socket.socket:
+def create_sctp_socket(host: str, port: int = NGAP_SCTP_PORT, timeout: float = 10.0) -> socket.socket:
     """
     Create and connect an SCTP socket suitable for sending NGAP messages.
     NGAP runs over SCTP on port 38412 (3GPP TS 38.412).
@@ -196,6 +196,7 @@ def create_sctp_socket(host: str, port: int = NGAP_SCTP_PORT) -> socket.socket:
     Args:
         host: Destination IP address of the AMF / 5G core
         port: SCTP port (default 38412)
+        timeout: Connect timeout in seconds (default 10)
 
     Returns:
         socket.socket: Connected SCTP one-to-one (SOCK_STREAM) socket
@@ -215,12 +216,20 @@ def create_sctp_socket(host: str, port: int = NGAP_SCTP_PORT) -> socket.socket:
         ) from e
 
     try:
+        sock.settimeout(timeout)
         sock.connect((host, port))
+        sock.settimeout(None)  # back to blocking for recv loop
     except ConnectionRefusedError:
         sock.close()
         raise ConnectionRefusedError(
             f"Connection refused to {host}:{port}. "
             "Make sure an AMF / 5G core is running and listening on that address and port."
+        )
+    except socket.timeout:
+        sock.close()
+        raise TimeoutError(
+            f"Connection to {host}:{port} timed out after {timeout}s. "
+            "Check the AMF IP/port and that the host is reachable."
         )
     return sock
 
