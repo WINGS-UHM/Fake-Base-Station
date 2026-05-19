@@ -25,23 +25,32 @@ try:
 except ImportError:
     _ZMQ_AVAILABLE = False
 
-try:
-    from fake_base_station.ng import Open5GSConnection, NGSetupRequestConfig
-    _OPEN5GS_AVAILABLE = True
-except ImportError:
+_OPEN5GS_AVAILABLE = False
+_OPEN5GS_IMPORT_ERROR = None
+Open5GSConnection = None  # type: ignore
+NGSetupRequestConfig = None  # type: ignore
+
+for _ng_path in [
+    None,  # already on sys.path?
+    __import__('os').path.join(__import__('os').path.dirname(__file__), '..'),          # src/
+    __import__('os').path.join(__import__('os').path.dirname(__file__), '..', '..'),    # project root
+    __import__('os').path.dirname(__file__),                                            # same dir
+]:
     try:
-        import sys as _sys, os as _os
-        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..'))
-        from fake_base_station.ng import Open5GSConnection, NGSetupRequestConfig
-        _OPEN5GS_AVAILABLE = True
-    except ImportError:
+        if _ng_path and _ng_path not in __import__('sys').path:
+            __import__('sys').path.insert(0, _ng_path)
         try:
-            from ng import Open5GSConnection, NGSetupRequestConfig  # type: ignore
-            _OPEN5GS_AVAILABLE = True
+            from fake_base_station.ng import Open5GSConnection, NGSetupRequestConfig  # type: ignore
         except ImportError:
-            Open5GSConnection = None  # type: ignore
-            NGSetupRequestConfig = None  # type: ignore
-            _OPEN5GS_AVAILABLE = False
+            from ng import Open5GSConnection, NGSetupRequestConfig  # type: ignore
+        _OPEN5GS_AVAILABLE = True
+        _OPEN5GS_IMPORT_ERROR = None
+        break
+    except Exception as _e:
+        _OPEN5GS_IMPORT_ERROR = str(_e)
+
+if not _OPEN5GS_AVAILABLE:
+    print(f"[ue_gui] WARNING: Could not import Open5GSConnection from ng.py: {_OPEN5GS_IMPORT_ERROR}")
 
 
 NGAP_SCTP_PORT = 38412
@@ -737,7 +746,12 @@ class UEGapGui:
     def _open5gs_connect(self):
         """Open SCTP connection to Open5GS AMF and send NGSetupRequest."""
         if not _OPEN5GS_AVAILABLE:
-            messagebox.showerror("Open5GS", "Open5GSConnection is not available.\nMake sure ng.py is on sys.path.")
+            detail = f"\n\nImport error:\n{_OPEN5GS_IMPORT_ERROR}" if _OPEN5GS_IMPORT_ERROR else ""
+            messagebox.showerror(
+                "Open5GS Unavailable",
+                f"Could not import Open5GSConnection from ng.py.{detail}\n\n"
+                "Check the terminal for details."
+            )
             return
         if self._open5gs_conn and self._open5gs_conn.is_connected:
             self._log("[Open5GS] Already connected.")
