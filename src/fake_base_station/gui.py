@@ -811,8 +811,10 @@ class NGAPPcapGui(tk.Tk):
                         self._log("Replay complete")
                     except Exception as e:
                         self._log(f"Replay failed: {e}")
+                    finally:
+                        self.replay_thread = None
 
-                self.replay_thread = threading.Thread(target=sctp_worker, daemon=False)
+                self.replay_thread = threading.Thread(target=sctp_worker, daemon=True)
                 self.replay_thread.start()
             elif protocol == "ZMQ":
                 endpoint = self.zmq_endpoint_var.get().strip()
@@ -826,8 +828,10 @@ class NGAPPcapGui(tk.Tk):
                         self._log("ZMQ replay complete")
                     except Exception as e:
                         self._log(f"ZMQ replay failed: {e}")
+                    finally:
+                        self.replay_thread = None
 
-                self.replay_thread = threading.Thread(target=zmq_worker, daemon=False)
+                self.replay_thread = threading.Thread(target=zmq_worker, daemon=True)
                 self.replay_thread.start()
             else:
                 def udp_worker():
@@ -836,8 +840,10 @@ class NGAPPcapGui(tk.Tk):
                         self._log("Replay complete")
                     except Exception as e:
                         self._log(f"Replay failed: {e}")
+                    finally:
+                        self.replay_thread = None
 
-                self.replay_thread = threading.Thread(target=udp_worker, daemon=False)
+                self.replay_thread = threading.Thread(target=udp_worker, daemon=True)
                 self.replay_thread.start()
 
         except Exception as exc:
