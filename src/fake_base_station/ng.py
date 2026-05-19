@@ -225,6 +225,338 @@ def create_sctp_socket(host: str, port: int = NGAP_SCTP_PORT) -> socket.socket:
     return sock
 
 
+# ---------------------------------------------------------------------------
+# NGAP message encoding helpers
+# ---------------------------------------------------------------------------
+
+# Minimal NAS 5GMM Registration Request for a test SUCI (null scheme, PLMN 001-01)
+# IMSI: 001010000010001 (matches default NGSetupRequestConfig PLMN)
+_DEFAULT_NAS_REGISTRATION_REQUEST = bytes.fromhex(
+    "7e004179000d"      # EPD=5GMM, SecHdr=plain, MsgType=RegReq, ngKSI+RegType, MobId-LV len=13
+    "0100f1100000"      # SUPI format=IMSI, PLMN 001-01, routing indicator 0000
+    "00000000100001"    # protection scheme=null, HN key id=0, MSIN=0000100001
+)
+
+
+def encode_initial_ue_message(
+    ran_ue_ngap_id: int,
+    nas_pdu: bytes = None,
+    config: "NGSetupRequestConfig" = None,
+) -> bytes:
+    """
+    Encode an NGAP InitialUEMessage containing a NAS PDU.
+
+    Args:
+        ran_ue_ngap_id: RAN-UE-NGAP-ID assigned by the (fake) gNB.
+        nas_pdu: NAS PDU bytes. Defaults to a minimal 5G Registration Request.
+        config: NGSetupRequestConfig for PLMN/TAC (uses defaults if None).
+
+    Returns:
+        bytes: APER-encoded NGAP InitialUEMessage PDU.
+    """
+    cfg = config or NGSetupRequestConfig()
+    nas_pdu = nas_pdu if nas_pdu is not None else _DEFAULT_NAS_REGISTRATION_REQUEST
+
+    val = ('initiatingMessage', {
+        'procedureCode': 15,   # id-initialUEMessage
+        'criticality': 'ignore',
+        'value': ('InitialUEMessage', {
+            'protocolIEs': [
+                {'id': 85, 'criticality': 'reject',
+                 'value': ('RAN-UE-NGAP-ID', ran_ue_ngap_id)},
+                {'id': 38, 'criticality': 'reject',
+                 'value': ('NAS-PDU', nas_pdu)},
+                {'id': 121, 'criticality': 'reject',
+                 'value': ('UserLocationInformation', (
+                     'userLocationInformationNR', {
+                         'nR-CGI': {
+                             'pLMNIdentity': cfg.plmn,
+                             'nRCellIdentity': (0, 36),
+                         },
+                         'tAI': {
+                             'pLMNIdentity': cfg.plmn,
+                             'tAC': cfg.tac,
+                         },
+                     }
+                 ))},
+                {'id': 90, 'criticality': 'ignore',
+                 'value': ('RRCEstablishmentCause', 'mo-Signalling')},
+            ]
+        })
+    })
+    pdu = NGAP.NGAP_PDU_Descriptions.NGAP_PDU
+    pdu.set_val(val)
+    return pdu.to_aper()
+
+
+def encode_ue_context_release_complete(
+    amf_ue_ngap_id: int,
+    ran_ue_ngap_id: int,
+) -> bytes:
+    """
+    Encode a UEContextReleaseComplete message.
+
+    Args:
+        amf_ue_ngap_id: AMF-UE-NGAP-ID received from the AMF.
+        ran_ue_ngap_id: RAN-UE-NGAP-ID assigned locally.
+
+    Returns:
+        bytes: APER-encoded NGAP UEContextReleaseComplete PDU.
+    """
+    val = ('successfulOutcome', {
+        'procedureCode': 41,   # id-UEContextRelease
+        'criticality': 'reject',
+        'value': ('UEContextReleaseComplete', {
+            'protocolIEs': [
+                {'id': 10,  'criticality': 'ignore',
+                 'value': ('AMF-UE-NGAP-ID', amf_ue_ngap_id)},
+                {'id': 85,  'criticality': 'ignore',
+                 'value': ('RAN-UE-NGAP-ID', ran_ue_ngap_id)},
+            ]
+        })
+    })
+    pdu = NGAP.NGAP_PDU_Descriptions.NGAP_PDU
+    pdu.set_val(val)
+    return pdu.to_aper()
+
+
+def decode_ngap_message(data: bytes) -> dict:
+    """
+    Decode a raw NGAP APER-encoded PDU and return a summary dict.
+
+    Returns:
+        dict with keys: 'message_name', 'procedure_code', 'type',
+                        'amf_ue_ngap_id' (int or None), 'ran_ue_ngap_id' (int or None)
+    """
+    result = {
+        'message_name': 'Unknown',
+        'procedure_code': None,
+        'type': None,
+        'amf_ue_ngap_id': None,
+        'ran_ue_ngap_id': None,
+    }
+    try:
+        pdu = NGAP.NGAP_PDU_Descriptions.NGAP_PDU
+        pdu.from_aper(data)
+        val = pdu.get_val()
+        if not val:
+            return result
+        pdu_type, content = val
+        result['type'] = pdu_type
+        result['procedure_code'] = content.get('procedureCode')
+        inner = content.get('value')
+        if inner and isinstance(inner, tuple) and len(inner) == 2:
+            result['message_name'] = inner[0]
+            body = inner[1]
+            ies = body.get('protocolIEs', []) if isinstance(body, dict) else []
+            for ie in ies:
+                ie_id = ie.get('id')
+                ie_val = ie.get('value')
+                if isinstance(ie_val, tuple) and len(ie_val) == 2:
+                    if ie_id == 10:   # AMF-UE-NGAP-ID
+                        result['amf_ue_ngap_id'] = ie_val[1]
+                    elif ie_id == 85:  # RAN-UE-NGAP-ID
+                        result['ran_ue_ngap_id'] = ie_val[1]
+    except Exception:
+        pass
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Open5GS NGAP connection (acts as a fake gNB toward the AMF)
+# ---------------------------------------------------------------------------
+
+class Open5GSConnection:
+    """
+    Maintains a fake-gNB NGAP connection to an Open5GS AMF over SCTP.
+
+    Lifecycle:
+      1. ``connect()`` – SCTP connect, NGSetup handshake, starts receive thread.
+      2. ``register_ue()`` – Send InitialUEMessage to trigger NAS Registration.
+      3. ``send_ue_context_release_complete()`` – Respond to a release command.
+      4. ``disconnect()`` – Close socket, stop receive thread.
+
+    Callbacks:
+      * ``on_message(msg_dict)`` – Called for every decoded incoming NGAP message.
+      * ``on_status(status_str)`` – Called on connection state changes / errors.
+    """
+
+    def __init__(
+        self,
+        amf_host: str,
+        amf_port: int = NGAP_SCTP_PORT,
+        config: "NGSetupRequestConfig" = None,
+        on_message=None,
+        on_status=None,
+    ):
+        self.amf_host = amf_host
+        self.amf_port = amf_port
+        self.config = config or NGSetupRequestConfig()
+        self.on_message = on_message   # callable(dict)
+        self.on_status = on_status     # callable(str)
+
+        self._sock: Optional[socket.socket] = None
+        self._rx_thread: Optional[threading.Thread] = None
+        self._running = False
+        self._lock = threading.Lock()
+
+        # UE context state
+        self.amf_ue_ngap_id: Optional[int] = None
+        self.ran_ue_ngap_id: int = 1   # locally assigned
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @property
+    def is_connected(self) -> bool:
+        return self._sock is not None and self._running
+
+    def connect(self) -> bool:
+        """
+        Connect to AMF, perform NGSetup handshake, start receive loop.
+
+        Returns True on success, False on failure (check on_status for reason).
+        """
+        if self.is_connected:
+            return True
+        try:
+            self._emit_status("Connecting to AMF …")
+            sock = create_sctp_socket(self.amf_host, self.amf_port)
+            self._sock = sock
+            self._running = True
+
+            # Start receive thread before sending (AMF may respond immediately)
+            self._rx_thread = threading.Thread(
+                target=self._receive_loop, daemon=True, name="Open5GS-RX"
+            )
+            self._rx_thread.start()
+
+            # Send NGSetupRequest
+            ng_setup = encode_ngsetup_request(self.config)
+            sock.sendall(ng_setup)
+            self._emit_status("NGSetupRequest sent – waiting for response …")
+            return True
+        except Exception as exc:
+            self._running = False
+            self._sock = None
+            self._emit_status(f"Connection failed: {exc}")
+            return False
+
+    def register_ue(self, nas_pdu: bytes = None) -> bool:
+        """
+        Send an InitialUEMessage to trigger 5G NAS Registration.
+
+        Args:
+            nas_pdu: Optional NAS PDU override; defaults to a test Registration Request.
+        """
+        if not self.is_connected:
+            self._emit_status("Not connected – call connect() first.")
+            return False
+        try:
+            msg = encode_initial_ue_message(self.ran_ue_ngap_id, nas_pdu, self.config)
+            self._sock.sendall(msg)
+            self._emit_status(f"InitialUEMessage sent (RAN-UE-NGAP-ID={self.ran_ue_ngap_id})")
+            return True
+        except Exception as exc:
+            self._emit_status(f"register_ue error: {exc}")
+            return False
+
+    def send_ue_context_release_complete(
+        self,
+        amf_ue_ngap_id: int = None,
+        ran_ue_ngap_id: int = None,
+    ) -> bool:
+        """
+        Send UEContextReleaseComplete to the AMF.
+
+        Args:
+            amf_ue_ngap_id: Override AMF ID (uses stored value if None).
+            ran_ue_ngap_id: Override RAN ID (uses stored value if None).
+        """
+        if not self.is_connected:
+            self._emit_status("Not connected – cannot send UEContextReleaseComplete.")
+            return False
+        amf_id = amf_ue_ngap_id if amf_ue_ngap_id is not None else self.amf_ue_ngap_id
+        ran_id = ran_ue_ngap_id if ran_ue_ngap_id is not None else self.ran_ue_ngap_id
+        if amf_id is None:
+            self._emit_status("AMF-UE-NGAP-ID unknown – register a UE first.")
+            return False
+        try:
+            msg = encode_ue_context_release_complete(amf_id, ran_id)
+            self._sock.sendall(msg)
+            self._emit_status(
+                f"UEContextReleaseComplete sent (AMF-ID={amf_id}, RAN-ID={ran_id})"
+            )
+            return True
+        except Exception as exc:
+            self._emit_status(f"send_ue_context_release_complete error: {exc}")
+            return False
+
+    def disconnect(self):
+        """Close the SCTP socket and stop the receive thread."""
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+        self._emit_status("Disconnected from AMF.")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _receive_loop(self):
+        """Background thread: receive SCTP data, decode, dispatch."""
+        buf = b""
+        while self._running and self._sock:
+            try:
+                chunk = self._sock.recv(65535)
+                if not chunk:
+                    self._emit_status("AMF closed connection.")
+                    self._running = False
+                    self._sock = None
+                    break
+                buf += chunk
+                # Try to decode each 4096-byte chunk as a full NGAP PDU
+                # (SCTP is message-oriented, so recv usually returns one PDU)
+                msg = decode_ngap_message(buf)
+                buf = b""
+
+                # Persist AMF-UE-NGAP-ID as soon as we see it
+                if msg.get('amf_ue_ngap_id') is not None:
+                    with self._lock:
+                        self.amf_ue_ngap_id = msg['amf_ue_ngap_id']
+
+                name = msg.get('message_name', 'Unknown')
+                self._emit_status(f"Received: {name}")
+
+                if name == 'NGSetupResponse':
+                    self._emit_status("NGSetup complete – connected to Open5GS AMF.")
+
+                if self.on_message:
+                    try:
+                        self.on_message(msg)
+                    except Exception:
+                        pass
+            except OSError:
+                if self._running:
+                    self._emit_status("Receive error – connection lost.")
+                self._running = False
+                self._sock = None
+                break
+
+    def _emit_status(self, msg: str):
+        print(f"[Open5GS] {msg}")
+        if self.on_status:
+            try:
+                self.on_status(msg)
+            except Exception:
+                pass
+
+
 class PCAPTrafficReplayer:
     """
     Load and replay NGAP traffic from a .pcap file.

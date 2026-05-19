@@ -25,8 +25,149 @@ try:
 except ImportError:
     _ZMQ_AVAILABLE = False
 
+try:
+    from fake_base_station.ng import Open5GSConnection, NGSetupRequestConfig
+    _OPEN5GS_AVAILABLE = True
+except ImportError:
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..'))
+        from fake_base_station.ng import Open5GSConnection, NGSetupRequestConfig
+        _OPEN5GS_AVAILABLE = True
+    except ImportError:
+        try:
+            from ng import Open5GSConnection, NGSetupRequestConfig  # type: ignore
+            _OPEN5GS_AVAILABLE = True
+        except ImportError:
+            Open5GSConnection = None  # type: ignore
+            NGSetupRequestConfig = None  # type: ignore
+            _OPEN5GS_AVAILABLE = False
+
 
 NGAP_SCTP_PORT = 38412
+
+
+# ---------------------------------------------------------------------------
+# UE action handler — maps NGAP message names to simulated UE behaviour
+# ---------------------------------------------------------------------------
+
+class UEState:
+    IDLE        = "IDLE"
+    CONNECTING  = "CONNECTING"
+    CONNECTED   = "CONNECTED"
+    RELEASING   = "RELEASING"
+    RELEASED    = "RELEASED"
+
+
+# Maps NGAP message name  ->  (requires_state, next_state, action_description)
+# requires_state=None means the action is valid in any state.
+_UE_ACTIONS: dict[str, tuple[str | None, str, str]] = {
+    # Setup / registration
+    "NGSetupResponse":                  (None,               UEState.IDLE,       "AMF accepted gNB setup — UE ready to register"),
+    "NGSetupFailure":                   (None,               UEState.IDLE,       "AMF rejected gNB setup — UE cannot register"),
+    "InitialUEMessage":                 (UEState.IDLE,       UEState.CONNECTING, "UE sending initial NAS message, starting RRC connection"),
+    "DownlinkNASTransport":             (None,               None,               "UE received NAS PDU from AMF — processing NAS layer"),
+    "UplinkNASTransport":               (None,               None,               "UE sending NAS PDU toward AMF"),
+    # Context setup
+    "InitialContextSetupRequest":       (None,               UEState.CONNECTED,  "UE setting up security context and radio bearers"),
+    "InitialContextSetupResponse":      (None,               UEState.CONNECTED,  "Context setup confirmed — UE is now fully connected"),
+    "InitialContextSetupFailure":       (None,               UEState.IDLE,       "Context setup failed — UE falling back to idle"),
+    # PDU sessions
+    "PDUSessionResourceSetupRequest":   (UEState.CONNECTED,  UEState.CONNECTED,  "UE establishing PDU session / data radio bearer"),
+    "PDUSessionResourceSetupResponse":  (UEState.CONNECTED,  UEState.CONNECTED,  "PDU session established — user-plane traffic can flow"),
+    "PDUSessionResourceReleaseCommand": (UEState.CONNECTED,  UEState.CONNECTED,  "UE tearing down PDU session / data radio bearer"),
+    "PDUSessionResourceReleaseResponse":(UEState.CONNECTED,  UEState.CONNECTED,  "PDU session released"),
+    "PDUSessionResourceModifyRequest":  (UEState.CONNECTED,  UEState.CONNECTED,  "UE modifying PDU session QoS / bearers"),
+    # Handover
+    "HandoverRequired":                 (UEState.CONNECTED,  UEState.CONNECTED,  "Source gNB requesting handover — UE preparing HO"),
+    "HandoverRequest":                  (None,               UEState.CONNECTED,  "Target gNB received HO request — UE admitting handover"),
+    "HandoverRequestAcknowledge":       (None,               UEState.CONNECTED,  "UE completed handover — now served by target gNB"),
+    "HandoverCommand":                  (UEState.CONNECTED,  UEState.CONNECTED,  "UE executing handover toward target cell"),
+    "HandoverFailure":                  (None,               UEState.CONNECTED,  "Handover failed — UE remaining on source gNB"),
+    "HandoverCancel":                   (None,               UEState.CONNECTED,  "Handover cancelled"),
+    # Paging
+    "Paging":                           (UEState.IDLE,       UEState.CONNECTING, "UE paged by network — initiating RRC connection"),
+    # UE context release
+    "UEContextReleaseCommand":          (None,               UEState.RELEASING,  "AMF/gNB commanding UE release — UE releasing RRC and NAS"),
+    "UEContextReleaseComplete":         (None,               UEState.RELEASED,   "UE context fully released — UE now in RRC idle"),
+    "UEContextReleaseRequest":          (UEState.CONNECTED,  UEState.RELEASING,  "UE/gNB requesting context release toward AMF"),
+    "UEContextModificationRequest":     (UEState.CONNECTED,  UEState.CONNECTED,  "AMF modifying UE context (security / restrictions)"),
+    "UEContextModificationResponse":    (UEState.CONNECTED,  UEState.CONNECTED,  "UE context modification accepted"),
+    "UEContextModificationFailure":     (UEState.CONNECTED,  UEState.CONNECTED,  "UE context modification rejected"),
+    # Error / misc
+    "ErrorIndication":                  (None,               None,               "Protocol error received — UE logging error indication"),
+    "AMFConfigurationUpdate":           (None,               None,               "AMF updated its configuration — UE acknowledging"),
+    "OverloadStart":                    (None,               None,               "Network overloaded — UE backing off new requests"),
+    "OverloadStop":                     (None,               None,               "Network overload cleared — UE resuming normal operation"),
+}
+
+
+class UEActionHandler:
+    """Simulates UE behaviour in response to received NGAP commands.
+
+    Tracks UE state and emits human-readable action strings for each
+    received message.  An optional `on_action` callback is called with
+    the action string so callers can log it wherever they like.
+    """
+
+    def __init__(self, on_action=None):
+        """
+        Args:
+            on_action: Optional callable(action_str) invoked for every event.
+        """
+        self.state = UEState.IDLE
+        self.on_action = on_action
+        self._lock = threading.Lock()
+
+    def handle(self, message_name: str | None, contains_release_signal: bool | None = None):
+        """Process an incoming NGAP message and emit a UE action.
+        
+        Args:
+            message_name: NGAP procedure name, e.g. 'UEContextReleaseCommand'
+            contains_release_signal: Override release flag from gNB GUI (may be None)
+        """
+        with self._lock:
+            name = message_name or "(unknown)"
+
+            # Special case: gNB GUI manually marked this packet as a release
+            if contains_release_signal is True and name not in _UE_ACTIONS:
+                name = "UEContextReleaseCommand"
+
+            if name not in _UE_ACTIONS:
+                action = f"Received unrecognised message '{name}' — no action taken (state: {self.state})"
+                self._emit(action)
+                return
+
+            req_state, next_state, description = _UE_ACTIONS[name]
+
+            if req_state is not None and self.state != req_state:
+                action = (
+                    f"[{name}] INVALID in current state {self.state} "
+                    f"(expected {req_state}) — ignoring"
+                )
+                self._emit(action)
+                return
+
+            prev_state = self.state
+            if next_state is not None:
+                self.state = next_state
+
+            state_change = (
+                f" [{prev_state} → {self.state}]" if next_state and next_state != prev_state else f" [state: {self.state}]"
+            )
+            action = f"[{name}] {description}{state_change}"
+            self._emit(action)
+
+    def _emit(self, action: str):
+        print(f"[UE ACTION] {action}")
+        if self.on_action:
+            self.on_action(action)
+
+    def reset(self):
+        """Reset UE state back to IDLE."""
+        with self._lock:
+            self.state = UEState.IDLE
+            self._emit("UE state reset to IDLE")
 
 
 def _extract_ngap_payload(packet):
@@ -265,13 +406,14 @@ class PacketListener:
 class ZmqPacketListener:
     """Receives raw NGAP payloads over a ZMQ PULL socket and decodes them."""
 
-    def __init__(self):
+    def __init__(self, ue_handler: UEActionHandler | None = None):
         self.packets_received = []
         self.lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
         self._socket = None
         self._context = None
+        self.ue_handler = ue_handler
 
     def start_listening(self, endpoint: str = "tcp://127.0.0.1:5555"):
         """Bind a ZMQ PULL socket on `endpoint` and start receiving."""
@@ -342,6 +484,10 @@ class ZmqPacketListener:
         with self.lock:
             self.packets_received.append(meta)
 
+        # Trigger UE action simulation
+        if self.ue_handler:
+            self.ue_handler.handle(message_name, release_signal if isinstance(release_signal, bool) else None)
+
     def stop_listening(self):
         self._stop_event.set()
         if self._thread:
@@ -361,8 +507,10 @@ class UEGapGui:
     
     def __init__(self):
         self.listener = PacketListener()
-        self.zmq_listener = ZmqPacketListener()
+        self.ue_handler = UEActionHandler(on_action=self._on_ue_action)
+        self.zmq_listener = ZmqPacketListener(ue_handler=self.ue_handler)
         self._active_listener = self.listener  # whichever is currently in use
+        self._open5gs_conn: 'Open5GSConnection | None' = None
         self.updating = False
         
         self.root = tk.Tk()
@@ -488,7 +636,46 @@ class UEGapGui:
         
         row += 1
         ttk.Separator(left).grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
-        
+
+        row += 1
+        ttk.Label(left, text="UE State", font=("Arial", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        row += 1
+        self.ue_state_var = tk.StringVar(value=UEState.IDLE)
+        tk.Label(left, textvariable=self.ue_state_var, font=("Arial", 11, "bold"), foreground="navy").grid(row=row, column=0, columnspan=2, sticky="w", padx=4)
+        ttk.Button(left, text="Reset", command=self._reset_ue_state).grid(row=row, column=2, sticky="ew", padx=4)
+
+        row += 1
+        ttk.Separator(left).grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
+
+        row += 1
+        ttk.Separator(left).grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
+
+        row += 1
+        ttk.Label(left, text="Open5GS Live Connection", font=("Arial", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        row += 1
+        ttk.Label(left, text="AMF IP").grid(row=row, column=0, sticky="w", pady=4)
+        self.amf_ip_var = tk.StringVar(value="127.0.0.1")
+        ttk.Entry(left, textvariable=self.amf_ip_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+
+        row += 1
+        ttk.Label(left, text="AMF Port").grid(row=row, column=0, sticky="w", pady=4)
+        self.amf_port_var = tk.StringVar(value="38412")
+        ttk.Entry(left, textvariable=self.amf_port_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+
+        row += 1
+        open5gs_btn_frame = ttk.Frame(left)
+        open5gs_btn_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        ttk.Button(open5gs_btn_frame, text="Connect", command=self._open5gs_connect).pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Button(open5gs_btn_frame, text="Disconnect", command=self._open5gs_disconnect).pack(side=tk.LEFT, padx=3)
+        ttk.Button(open5gs_btn_frame, text="Register UE", command=self._open5gs_register_ue).pack(side=tk.LEFT, padx=3)
+
+        row += 1
+        ttk.Label(left, text="Open5GS Status").grid(row=row, column=0, sticky="w", pady=4)
+        self.open5gs_status_var = tk.StringVar(value="Disconnected")
+        tk.Label(left, textvariable=self.open5gs_status_var, foreground="gray", wraplength=160, justify="left").grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+
         row += 1
         ttk.Button(left, text="Clear All Packets", command=self._clear_packets).grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
         
@@ -529,6 +716,97 @@ class UEGapGui:
         self.log_text = ScrolledText(log_frame, height=10, width=120, state=tk.DISABLED)
         self.log_text.grid(row=0, column=0, sticky="nsew")
     
+    def _on_ue_action(self, action: str):
+        """Receive UE action string from UEActionHandler and append to GUI log."""
+        self._log(f"[UE] {action}")
+        # Update the UE state badge on the left panel
+        self.root.after(0, lambda: self.ue_state_var.set(self.ue_handler.state))
+        # Auto-respond to UEContextReleaseCommand over live Open5GS connection
+        if 'UEContextReleaseCommand' in action and self._open5gs_conn and self._open5gs_conn.is_connected:
+            self.root.after(100, self._open5gs_send_release_complete)
+
+    def _reset_ue_state(self):
+        """Reset UE state machine to IDLE."""
+        self.ue_handler.reset()
+        self.ue_state_var.set(self.ue_handler.state)
+
+    # ------------------------------------------------------------------
+    # Open5GS connection handlers
+    # ------------------------------------------------------------------
+
+    def _open5gs_connect(self):
+        """Open SCTP connection to Open5GS AMF and send NGSetupRequest."""
+        if not _OPEN5GS_AVAILABLE:
+            messagebox.showerror("Open5GS", "Open5GSConnection is not available.\nMake sure ng.py is on sys.path.")
+            return
+        if self._open5gs_conn and self._open5gs_conn.is_connected:
+            self._log("[Open5GS] Already connected.")
+            return
+        try:
+            amf_ip = self.amf_ip_var.get().strip()
+            amf_port = int(self.amf_port_var.get().strip())
+            self._open5gs_conn = Open5GSConnection(
+                amf_host=amf_ip,
+                amf_port=amf_port,
+                on_message=self._open5gs_on_message,
+                on_status=self._open5gs_on_status,
+            )
+            ok = self._open5gs_conn.connect()
+            if ok:
+                self._update_open5gs_status("Connecting…", "orange")
+            else:
+                self._update_open5gs_status("Connection failed", "red")
+        except Exception as exc:
+            self._log(f"[Open5GS] Connect error: {exc}")
+            messagebox.showerror("Open5GS", str(exc))
+
+    def _open5gs_disconnect(self):
+        """Disconnect from Open5GS AMF."""
+        if self._open5gs_conn:
+            self._open5gs_conn.disconnect()
+            self._open5gs_conn = None
+        self._update_open5gs_status("Disconnected", "gray")
+
+    def _open5gs_register_ue(self):
+        """Send InitialUEMessage to trigger NAS Registration."""
+        if not self._open5gs_conn or not self._open5gs_conn.is_connected:
+            messagebox.showwarning("Open5GS", "Not connected to AMF. Click Connect first.")
+            return
+        self._open5gs_conn.register_ue()
+
+    def _open5gs_send_release_complete(self):
+        """Send UEContextReleaseComplete (called automatically on release command)."""
+        if self._open5gs_conn and self._open5gs_conn.is_connected:
+            self._open5gs_conn.send_ue_context_release_complete()
+
+    def _open5gs_on_message(self, msg: dict):
+        """Called from Open5GS receive thread – dispatch to GUI via root.after."""
+        name = msg.get('message_name', 'Unknown')
+        self.root.after(0, lambda: self._log(f"[Open5GS] ← {name}"))
+
+    def _open5gs_on_status(self, status: str):
+        """Called from Open5GS connection on status change."""
+        color = "green" if "complete" in status.lower() or "sent" in status.lower() else \
+                "red" if "fail" in status.lower() or "error" in status.lower() or "lost" in status.lower() else \
+                "orange"
+        self.root.after(0, lambda s=status, c=color: (
+            self._log(f"[Open5GS] {s}"),
+            self._update_open5gs_status(s, c),
+        ))
+
+    def _update_open5gs_status(self, text: str, color: str = "gray"):
+        """Update the Open5GS status label (must be called on main thread)."""
+        self.open5gs_status_var.set(text)
+        # find the label widget and update foreground color
+        try:
+            for widget in self.root.winfo_descendants():
+                if isinstance(widget, tk.Label) and widget.cget('textvariable') and \
+                        str(widget.cget('textvariable')) == str(self.open5gs_status_var):
+                    widget.config(foreground=color)
+                    break
+        except Exception:
+            pass
+
     def _on_mode_change(self):
         """Show/hide interface vs ZMQ endpoint fields based on selected mode."""
         if self.listen_mode_var.get() == "ZMQ":
@@ -703,6 +981,8 @@ class UEGapGui:
         finally:
             self.listener.stop_listening()
             self.zmq_listener.stop_listening()
+            if self._open5gs_conn:
+                self._open5gs_conn.disconnect()
 
 
 def main():
