@@ -4,12 +4,17 @@ Provides methods to setup, encode, and decode NGAP messages.
 """
 
 from pycrate_asn1dir import NGAP
-from scapy.all import rdpcap
+from scapy.all import rdpcap, wrpcap
 from pathlib import Path
 from typing import List, Optional, Iterator, Tuple, Callable
 import socket
 import time
 import threading
+try:
+    import zmq
+    _ZMQ_AVAILABLE = True
+except ImportError:
+    _ZMQ_AVAILABLE = False
 
 
 class NGSetupRequestConfig:
@@ -227,18 +232,21 @@ class PCAPTrafficReplayer:
     methods to iterate through and decode them.
     """
     
-    def __init__(self, pcap_file: str | Path):
+    def __init__(self, pcap_file: str | Path, source_ip: Optional[str] = None):
         """
         Initialize the traffic replayer with a pcap file.
         
         Args:
             pcap_file: Path to the .pcap file
+            source_ip: Optional source IP filter. If set, only packets with this
+                source IP are considered for extraction/replay.
             
         Raises:
             FileNotFoundError: If the pcap file doesn't exist
             Exception: If the pcap file cannot be read
         """
         self.pcap_file = Path(pcap_file)
+        self.source_ip = source_ip
         
         if not self.pcap_file.exists():
             raise FileNotFoundError(f"PCAP file not found: {self.pcap_file}")
@@ -246,6 +254,18 @@ class PCAPTrafficReplayer:
         self.packets = []
         self.ngap_messages = []
         self._load_pcap()
+
+    def _packet_matches_source_filter(self, packet) -> bool:
+        """Return True if packet matches the configured source IP filter."""
+        if not self.source_ip:
+            return True
+
+        from scapy.layers.inet import IP
+
+        if not packet.haslayer(IP):
+            return False
+
+        return packet[IP].src == self.source_ip
     
     def _load_pcap(self):
         """Load and parse the pcap file."""
@@ -260,13 +280,13 @@ class PCAPTrafficReplayer:
         from scapy.layers.inet import IP, UDP
         from scapy.layers.sctp import SCTP
         
-        NGAP_MARKER = b'ngap'
-        NGAP_MARKER_SEARCH_LIMIT = 16  # Search within first N bytes for the marker
-        
         self.ngap_messages = []
         base_time = None
         
         for idx, packet in enumerate(self.packets):
+            if not self._packet_matches_source_filter(packet):
+                continue
+
             payload = None
             
             # Extract timestamp
@@ -286,12 +306,10 @@ class PCAPTrafficReplayer:
             elif packet.haslayer('Raw'):
                 raw_data = bytes(packet['Raw'].load)
             
-            # Detect NGAP by looking for 'ngap' marker near start of raw data
+            # Keep full transport payload bytes as the NGAP PDU payload.
+            # Previous marker-based slicing could truncate/offset the PDU.
             if raw_data:
-                marker_pos = raw_data.find(NGAP_MARKER, 0, NGAP_MARKER_SEARCH_LIMIT + len(NGAP_MARKER))
-                if marker_pos != -1:
-                    # NGAP PDU starts immediately after the 'ngap' marker
-                    payload = raw_data[marker_pos + len(NGAP_MARKER):]
+                payload = raw_data
             
             if payload:
                 src_ip = packet[IP].src if packet.haslayer(IP) else None
@@ -329,6 +347,9 @@ class PCAPTrafficReplayer:
         base_time = None
         
         for idx, packet in enumerate(self.packets):
+            if not self._packet_matches_source_filter(packet):
+                continue
+
             # Extract timestamp
             timestamp = packet.time if hasattr(packet, 'time') else None
             if base_time is None and timestamp is not None:
@@ -341,7 +362,11 @@ class PCAPTrafficReplayer:
             from scapy.layers.inet import IP, UDP
             from scapy.layers.sctp import SCTP
             
-            if packet.haslayer('Raw'):
+            if packet.haslayer(SCTP) and packet[SCTP].haslayer('Raw'):
+                payload = bytes(packet[SCTP]['Raw'].load)
+            elif packet.haslayer(UDP) and packet[UDP].haslayer('Raw'):
+                payload = bytes(packet[UDP]['Raw'].load)
+            elif packet.haslayer('Raw'):
                 payload = bytes(packet['Raw'].load)
             
             if payload:
@@ -444,6 +469,7 @@ class PCAPTrafficReplayer:
         return (
             f"PCAP Traffic Summary:\n"
             f"  File: {self.pcap_file}\n"
+            f"  Source IP filter: {self.source_ip if self.source_ip else 'None'}\n"
             f"  Total packets: {self.get_packet_count()}\n"
             f"  NGAP messages: {self.get_message_count()}\n"
             f"  Message sizes: {[len(m['payload']) for m in self.ngap_messages]}"
@@ -678,6 +704,129 @@ class PCAPTrafficReplayer:
         thread.start()
         return thread
 
+    def replay_to_zmq(
+        self,
+        endpoint: str = "tcp://127.0.0.1:5555",
+        socket_type: str = "PUSH",
+        speed_factor: float = 1.0,
+        on_packet_sent: Optional[Callable[[int, bytes], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+        packet_type: str = "ngap_only",
+    ) -> None:
+        """
+        Replay captured packets over a ZMQ socket (no USRP / radio hardware needed).
+
+        Uses ZeroMQ instead of SCTP/UDP so the receiver only needs a matching
+        ZMQ socket — no kernel SCTP support required and no SDR hardware required.
+
+        Supported socket_type values:
+          - "PUSH" : paired with a PULL listener (pipeline pattern, default)
+          - "PUB"  : paired with a SUB listener (publish-subscribe pattern)
+
+        Args:
+            endpoint:    ZMQ endpoint string, e.g. "tcp://127.0.0.1:5555"
+            socket_type: ZMQ socket type to use — "PUSH" or "PUB"
+            speed_factor: Replay speed multiplier (1.0 = real-time)
+            on_packet_sent: Optional callback called with (index, payload) after each send
+            stop_event:  Optional threading.Event to stop replay early
+            packet_type: "ngap_only" or "all"
+
+        Raises:
+            ImportError: If pyzmq is not installed (pip install pyzmq)
+            ValueError:  If socket_type or packet_type is invalid
+            RuntimeError: If no messages to replay
+        """
+        if not _ZMQ_AVAILABLE:
+            raise ImportError(
+                "pyzmq is not installed. Install it with: pip install pyzmq"
+            )
+
+        if socket_type not in ("PUSH", "PUB"):
+            raise ValueError(f"socket_type must be 'PUSH' or 'PUB', got '{socket_type}'")
+
+        if packet_type not in ("ngap_only", "all"):
+            raise ValueError(f"packet_type must be 'ngap_only' or 'all', got '{packet_type}'")
+
+        messages = self.ngap_messages if packet_type == "ngap_only" else self._get_all_packet_payloads()
+
+        if not messages:
+            raise RuntimeError(f"No {packet_type} messages to replay")
+
+        zmq_type = zmq.PUSH if socket_type == "PUSH" else zmq.PUB
+        context = zmq.Context()
+        sock = context.socket(zmq_type)
+        sock.bind(endpoint)
+
+        # PUB sockets need a brief settle time so subscribers can connect
+        if socket_type == "PUB":
+            time.sleep(0.1)
+
+        try:
+            print(f"Starting ZMQ {socket_type} replay on {endpoint} at {speed_factor}x speed ({packet_type})...")
+
+            for msg_idx, msg in enumerate(messages):
+                if stop_event and stop_event.is_set():
+                    print("Replay stopped by stop_event")
+                    break
+
+                if msg_idx > 0:
+                    wait_time = (msg['relative_time'] - messages[msg_idx - 1]['relative_time']) / speed_factor
+                    if wait_time > 0:
+                        time.sleep(float(wait_time))
+
+                sock.send(msg['payload'])
+
+                if on_packet_sent:
+                    on_packet_sent(msg_idx, msg['payload'])
+
+                print(f"  [{msg_idx}] Sent {len(msg['payload'])} bytes via ZMQ {socket_type}")
+
+            print("ZMQ replay complete")
+
+        finally:
+            sock.close()
+            context.term()
+
+    def replay_zmq_threaded(
+        self,
+        endpoint: str = "tcp://127.0.0.1:5555",
+        socket_type: str = "PUSH",
+        speed_factor: float = 1.0,
+        on_packet_sent: Optional[Callable[[int, bytes], None]] = None,
+        packet_type: str = "ngap_only",
+    ) -> threading.Thread:
+        """
+        Start ZMQ replay in a background thread.
+
+        The returned thread has a ``.stop_event`` attribute (threading.Event)
+        that can be set to terminate the replay early.
+
+        Args:
+            endpoint:    ZMQ endpoint string, e.g. "tcp://127.0.0.1:5555"
+            socket_type: "PUSH" (default) or "PUB"
+            speed_factor: Replay speed multiplier
+            on_packet_sent: Optional callback called with (index, payload)
+            packet_type: "ngap_only" or "all"
+
+        Returns:
+            threading.Thread: Started replay thread with a .stop_event attribute
+        """
+        stop_event = threading.Event()
+
+        def replay_worker():
+            try:
+                self.replay_to_zmq(
+                    endpoint, socket_type, speed_factor,
+                    on_packet_sent, stop_event, packet_type
+                )
+            except Exception as e:
+                print(f"ZMQ replay failed: {e}")
+
+        thread = threading.Thread(target=replay_worker, daemon=False)
+        thread.stop_event = stop_event
+        thread.start()
+        return thread
+
     def get_timing_info(self) -> str:
         """
         Get timing information for all messages.
@@ -702,3 +851,69 @@ class PCAPTrafficReplayer:
             result += f"{idx:5} | {msg['relative_time']:8.3f} | {delta_str:>9} | {len(msg['payload']):>11}\n"
         
         return result
+
+
+def save_modified_ngap_pcap(
+    input_pcap: str | Path,
+    output_pcap: str | Path,
+    new_dst_ip: str,
+    source_ip: Optional[str] = None,
+    ngap_port: int = NGAP_SCTP_PORT,
+) -> tuple[int, int]:
+    """
+    Save a copy of a PCAP with destination IP rewritten for NGAP packets.
+
+    Args:
+        input_pcap: Source pcap path.
+        output_pcap: Output pcap path to write.
+        new_dst_ip: Destination IP to apply to matching packets.
+        source_ip: Optional source IP filter.
+        ngap_port: Port used to identify NGAP transport packets.
+
+    Returns:
+        tuple[int, int]: (modified_packet_count, total_packet_count)
+    """
+    from scapy.layers.inet import IP, UDP
+    from scapy.layers.sctp import SCTP
+
+    input_path = Path(input_pcap)
+    output_path = Path(output_pcap)
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"PCAP file not found: {input_path}")
+
+    packets = rdpcap(str(input_path))
+    modified_count = 0
+
+    for packet in packets:
+        if not packet.haslayer(IP):
+            continue
+
+        if source_ip and packet[IP].src != source_ip:
+            continue
+
+        is_ngap_packet = False
+        if packet.haslayer(SCTP):
+            sctp_layer = packet[SCTP]
+            is_ngap_packet = (sctp_layer.sport == ngap_port) or (sctp_layer.dport == ngap_port)
+        elif packet.haslayer(UDP):
+            udp_layer = packet[UDP]
+            is_ngap_packet = (udp_layer.sport == ngap_port) or (udp_layer.dport == ngap_port)
+
+        if not is_ngap_packet:
+            continue
+
+        packet[IP].dst = new_dst_ip
+        if hasattr(packet[IP], "chksum"):
+            del packet[IP].chksum
+
+        if packet.haslayer(SCTP) and hasattr(packet[SCTP], "chksum"):
+            del packet[SCTP].chksum
+        if packet.haslayer(UDP) and hasattr(packet[UDP], "chksum"):
+            del packet[UDP].chksum
+
+        modified_count += 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wrpcap(str(output_path), packets)
+    return modified_count, len(packets)
