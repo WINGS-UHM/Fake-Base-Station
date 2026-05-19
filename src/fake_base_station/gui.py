@@ -2,6 +2,7 @@ import ipaddress
 import threading
 import tkinter as tk
 import socket
+import time
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -15,6 +16,12 @@ try:
     from pycrate_asn1dir import NGAP
 except ImportError:
     NGAP = None
+
+try:
+    import zmq
+    _ZMQ_AVAILABLE = True
+except ImportError:
+    _ZMQ_AVAILABLE = False
 
 
 NGAP_SCTP_PORT = 38412
@@ -264,6 +271,43 @@ class ModifiedPcapReplayer:
         finally:
             sock.close()
 
+    def replay_to_zmq(self, endpoint: str, on_packet_sent=None):
+        """Send raw NGAP payloads over a ZMQ PUSH socket.
+        
+        Extracts the NGAP bytes from each packet and pushes them to `endpoint`
+        so the UE Listener (bound as PULL) can receive and decode them directly
+        without needing SCTP kernel support or radio hardware.
+
+        Args:
+            endpoint: ZMQ endpoint, e.g. "tcp://127.0.0.1:5555"
+            on_packet_sent: Optional callback(index, size)
+        """
+        if not _ZMQ_AVAILABLE:
+            raise ImportError("pyzmq is not installed. Run: pip install pyzmq")
+        if not self.packets:
+            raise RuntimeError("No packets to replay")
+
+        context = zmq.Context()
+        sock = context.socket(zmq.PUSH)
+        sock.connect(endpoint)
+        # Brief settle so the PULL side is ready
+        time.sleep(0.05)
+
+        try:
+            for pkt_dict in self.packets:
+                packet = pkt_dict["packet"]
+                # Extract raw NGAP payload bytes so the receiver can decode directly
+                ngap_bytes = _extract_ngap_payload(packet)
+                if ngap_bytes is None:
+                    # Fall back to full packet bytes if no NGAP layer found
+                    ngap_bytes = bytes(packet)
+                sock.send(ngap_bytes)
+                if on_packet_sent:
+                    on_packet_sent(pkt_dict.get("index", 0), len(ngap_bytes))
+        finally:
+            sock.close()
+            context.term()
+
 
 class NGAPPcapGui(tk.Tk):
     def __init__(self):
@@ -342,7 +386,19 @@ class NGAPPcapGui(tk.Tk):
         row += 1
         ttk.Label(left, text="Protocol").grid(row=row, column=0, sticky="w", pady=4)
         self.replay_protocol_var = tk.StringVar(value="UDP")
-        ttk.Combobox(left, textvariable=self.replay_protocol_var, values=["UDP", "SCTP"], state="readonly").grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        proto_cb = ttk.Combobox(left, textvariable=self.replay_protocol_var, values=["UDP", "SCTP", "ZMQ"], state="readonly")
+        proto_cb.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        proto_cb.bind("<<ComboboxSelected>>", self._on_protocol_change)
+
+        row += 1
+        self._zmq_endpoint_label = ttk.Label(left, text="ZMQ Endpoint")
+        self._zmq_endpoint_label.grid(row=row, column=0, sticky="w", pady=4)
+        self.zmq_endpoint_var = tk.StringVar(value="tcp://127.0.0.1:5555")
+        self._zmq_endpoint_entry = ttk.Entry(left, textvariable=self.zmq_endpoint_var)
+        self._zmq_endpoint_entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        # Hide ZMQ endpoint row by default
+        self._zmq_endpoint_label.grid_remove()
+        self._zmq_endpoint_entry.grid_remove()
 
         row += 1
         ttk.Separator(left).grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
@@ -447,6 +503,15 @@ class NGAPPcapGui(tk.Tk):
 
         self.log_text = ScrolledText(log_frame, wrap=tk.WORD, state=tk.DISABLED, height=10)
         self.log_text.grid(row=0, column=0, sticky="nsew")
+
+    def _on_protocol_change(self, _event=None):
+        """Show/hide ZMQ endpoint field based on selected protocol."""
+        if self.replay_protocol_var.get() == "ZMQ":
+            self._zmq_endpoint_label.grid()
+            self._zmq_endpoint_entry.grid()
+        else:
+            self._zmq_endpoint_label.grid_remove()
+            self._zmq_endpoint_entry.grid_remove()
 
     def _log(self, message: str):
         def append():
@@ -735,6 +800,21 @@ class NGAPPcapGui(tk.Tk):
                         self._log(f"Replay failed: {e}")
 
                 self.replay_thread = threading.Thread(target=sctp_worker, daemon=False)
+                self.replay_thread.start()
+            elif protocol == "ZMQ":
+                endpoint = self.zmq_endpoint_var.get().strip()
+                if not endpoint:
+                    raise ValueError("ZMQ endpoint cannot be empty")
+                self._log(f"Replaying {len(packets_to_replay)} packets via ZMQ PUSH to {endpoint}")
+
+                def zmq_worker():
+                    try:
+                        replayer.replay_to_zmq(endpoint=endpoint, on_packet_sent=on_packet_sent)
+                        self._log("ZMQ replay complete")
+                    except Exception as e:
+                        self._log(f"ZMQ replay failed: {e}")
+
+                self.replay_thread = threading.Thread(target=zmq_worker, daemon=False)
                 self.replay_thread.start()
             else:
                 def udp_worker():

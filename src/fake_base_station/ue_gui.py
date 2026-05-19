@@ -18,6 +18,12 @@ try:
 except ImportError:
     NGAP = None
 
+try:
+    import zmq
+    _ZMQ_AVAILABLE = True
+except ImportError:
+    _ZMQ_AVAILABLE = False
+
 
 NGAP_SCTP_PORT = 38412
 
@@ -77,8 +83,31 @@ def _detect_release_signal(payload: bytes) -> bool | None:
         return None
 
 
+def _extract_message_name(payload: bytes) -> str | None:
+    """Extract NGAP message name from raw payload bytes."""
+    if NGAP is None or not payload:
+        return None
+    try:
+        pdu = NGAP.NGAP_PDU_Descriptions.NGAP_PDU
+        pdu.from_aper(payload)
+        py_pdu = _to_python_pdu(pdu)
+        if not (isinstance(py_pdu, tuple) and len(py_pdu) == 2):
+            return None
+        _, message_container = py_pdu
+        if not isinstance(message_container, dict):
+            return None
+        value = message_container.get("value")
+        if isinstance(value, tuple) and len(value) == 2:
+            name = value[0]
+            if isinstance(name, str):
+                return name
+        return None
+    except Exception:
+        return None
+
+
 class PacketListener:
-    """Captures incoming packets and extracts metadata."""
+    """Captures incoming packets via network sniffing and extracts metadata."""
     
     def __init__(self):
         self.packets_received = []
@@ -162,9 +191,11 @@ class PacketListener:
                 if packet[UDP].haslayer("Raw"):
                     payload_size = len(packet[UDP]["Raw"].load)
             
+            message_name = None
             if is_ngap:
                 payload = _extract_ngap_payload(packet)
                 contains_release_signal = _detect_release_signal(payload)
+                message_name = _extract_message_name(payload)
 
             timestamp = float(packet.time) if hasattr(packet, "time") else 0.0
             
@@ -180,6 +211,7 @@ class PacketListener:
                 "is_ngap": is_ngap,
                 "contains_release_signal": contains_release_signal,
                 "payload_size": payload_size,
+                "message_name": message_name,
             }
             
             # Check filters before storing
@@ -229,11 +261,85 @@ class PacketListener:
             self.packets_received.clear()
 
 
+class ZmqPacketListener:
+    """Receives raw NGAP payloads over a ZMQ PULL socket and decodes them."""
+
+    def __init__(self):
+        self.packets_received = []
+        self.lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._socket = None
+        self._context = None
+
+    def start_listening(self, endpoint: str = "tcp://127.0.0.1:5555"):
+        """Bind a ZMQ PULL socket on `endpoint` and start receiving."""
+        if not _ZMQ_AVAILABLE:
+            raise ImportError("pyzmq is not installed. Run: pip install pyzmq")
+        self._stop_event.clear()
+        self._endpoint = endpoint
+
+        def _worker():
+            self._context = zmq.Context()
+            self._socket = self._context.socket(zmq.PULL)
+            self._socket.bind(endpoint)
+            self._socket.setsockopt(zmq.RCVTIMEO, 500)  # 500 ms poll timeout
+            try:
+                while not self._stop_event.is_set():
+                    try:
+                        raw = self._socket.recv()
+                    except zmq.Again:
+                        continue  # timeout, check stop_event
+                    self._handle_message(raw)
+            finally:
+                self._socket.close()
+                self._context.term()
+
+        self._thread = threading.Thread(target=_worker, daemon=True)
+        self._thread.start()
+
+    def _handle_message(self, raw: bytes):
+        message_name = _extract_message_name(raw)
+        release_signal = _detect_release_signal(raw)
+        ts = datetime.now()
+        meta = {
+            "timestamp": ts.timestamp(),
+            "datetime": ts.strftime("%H:%M:%S"),
+            "packet": None,
+            "src_ip": "zmq-sender",
+            "dst_ip": "zmq-self",
+            "src_port": None,
+            "dst_port": None,
+            "protocol": "ZMQ",
+            "is_ngap": message_name is not None,
+            "contains_release_signal": release_signal,
+            "payload_size": len(raw),
+            "message_name": message_name or "(unknown)",
+        }
+        with self.lock:
+            self.packets_received.append(meta)
+
+    def stop_listening(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def get_packets(self):
+        with self.lock:
+            return list(self.packets_received)
+
+    def clear_packets(self):
+        with self.lock:
+            self.packets_received.clear()
+
+
 class UEGapGui:
     """User Equipment NGAP Packet Listener GUI."""
     
     def __init__(self):
         self.listener = PacketListener()
+        self.zmq_listener = ZmqPacketListener()
+        self._active_listener = self.listener  # whichever is currently in use
         self.updating = False
         
         self.root = tk.Tk()
@@ -267,10 +373,30 @@ class UEGapGui:
         ttk.Label(left, text="Listener Configuration", font=("Arial", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
         
         row += 1
+        ttk.Label(left, text="Listen Mode", font=("Arial", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        row += 1
+        self.listen_mode_var = tk.StringVar(value="Sniff")
+        mode_frame = ttk.Frame(left)
+        mode_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        ttk.Radiobutton(mode_frame, text="Network Sniff", variable=self.listen_mode_var, value="Sniff", command=self._on_mode_change).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(mode_frame, text="ZMQ PULL", variable=self.listen_mode_var, value="ZMQ", command=self._on_mode_change).pack(side=tk.LEFT)
+
+        row += 1
         ttk.Label(left, text="Interface").grid(row=row, column=0, sticky="w", pady=4)
         self.iface_var = tk.StringVar(value="")
-        ttk.Entry(left, textvariable=self.iface_var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        self._iface_entry = ttk.Entry(left, textvariable=self.iface_var)
+        self._iface_entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
         ttk.Label(left, text="(empty=all)", font=("Arial", 8)).grid(row=row+1, column=1, sticky="w", padx=6)
+
+        row += 2
+        self._zmq_ep_label = ttk.Label(left, text="ZMQ Endpoint")
+        self._zmq_ep_label.grid(row=row, column=0, sticky="w", pady=4)
+        self.zmq_endpoint_var = tk.StringVar(value="tcp://127.0.0.1:5555")
+        self._zmq_ep_entry = ttk.Entry(left, textvariable=self.zmq_endpoint_var)
+        self._zmq_ep_entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        self._zmq_ep_label.grid_remove()
+        self._zmq_ep_entry.grid_remove()
         
         row += 2
         ttk.Label(left, text="Status").grid(row=row, column=0, sticky="w", pady=4)
@@ -349,18 +475,19 @@ class UEGapGui:
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
         
-        columns = ("Time", "Src", "Dst", "Protocol", "SrcPort", "DstPort", "Payload", "NGAP", "Release")
+        columns = ("Time", "Src", "Dst", "Protocol", "SrcPort", "DstPort", "Payload", "NGAP", "Message", "Release")
         self.packet_tree = ttk.Treeview(list_frame, columns=columns, height=25, selectmode="extended")
         self.packet_tree.column("#0", width=0, stretch=tk.NO)
         self.packet_tree.column("Time", anchor=tk.CENTER, width=80)
-        self.packet_tree.column("Src", anchor=tk.W, width=120)
-        self.packet_tree.column("Dst", anchor=tk.W, width=120)
-        self.packet_tree.column("Protocol", anchor=tk.CENTER, width=70)
-        self.packet_tree.column("SrcPort", anchor=tk.CENTER, width=70)
-        self.packet_tree.column("DstPort", anchor=tk.CENTER, width=70)
-        self.packet_tree.column("Payload", anchor=tk.CENTER, width=70)
-        self.packet_tree.column("NGAP", anchor=tk.CENTER, width=60)
-        self.packet_tree.column("Release", anchor=tk.CENTER, width=70)
+        self.packet_tree.column("Src", anchor=tk.W, width=110)
+        self.packet_tree.column("Dst", anchor=tk.W, width=110)
+        self.packet_tree.column("Protocol", anchor=tk.CENTER, width=60)
+        self.packet_tree.column("SrcPort", anchor=tk.CENTER, width=65)
+        self.packet_tree.column("DstPort", anchor=tk.CENTER, width=65)
+        self.packet_tree.column("Payload", anchor=tk.CENTER, width=65)
+        self.packet_tree.column("NGAP", anchor=tk.CENTER, width=50)
+        self.packet_tree.column("Message", anchor=tk.W, width=220)
+        self.packet_tree.column("Release", anchor=tk.CENTER, width=60)
         
         for col in columns:
             self.packet_tree.heading(col, text=col)
@@ -379,6 +506,17 @@ class UEGapGui:
         self.log_text = ScrolledText(log_frame, height=10, width=120, state=tk.DISABLED)
         self.log_text.grid(row=0, column=0, sticky="nsew")
     
+    def _on_mode_change(self):
+        """Show/hide interface vs ZMQ endpoint fields based on selected mode."""
+        if self.listen_mode_var.get() == "ZMQ":
+            self._iface_entry.grid_remove()
+            self._zmq_ep_label.grid()
+            self._zmq_ep_entry.grid()
+        else:
+            self._zmq_ep_label.grid_remove()
+            self._zmq_ep_entry.grid_remove()
+            self._iface_entry.grid()
+
     def _log(self, message: str):
         """Append message to log."""
         self.log_text.config(state=tk.NORMAL)
@@ -389,13 +527,23 @@ class UEGapGui:
     def _start_listening(self):
         """Start packet listener."""
         try:
-            iface = self.iface_var.get().strip() or None
-            self.listener.clear_packets()
-            self.listener.start_listening(iface=iface)
-            self.status_var.set("Listening...")
-            self.status_var.set("Listening")
-            self.root.winfo_toplevel().configure(fg="green")
-            self._log(f"Listener started on interface: {iface or 'all'}")
+            mode = self.listen_mode_var.get()
+            if mode == "ZMQ":
+                endpoint = self.zmq_endpoint_var.get().strip()
+                if not endpoint:
+                    raise ValueError("ZMQ endpoint cannot be empty")
+                self.zmq_listener.clear_packets()
+                self.zmq_listener.start_listening(endpoint=endpoint)
+                self._active_listener = self.zmq_listener
+                self.status_var.set("Listening (ZMQ)")
+                self._log(f"ZMQ PULL listener bound on {endpoint}")
+            else:
+                iface = self.iface_var.get().strip() or None
+                self.listener.clear_packets()
+                self.listener.start_listening(iface=iface)
+                self._active_listener = self.listener
+                self.status_var.set("Listening")
+                self._log(f"Sniff listener started on interface: {iface or 'all'}")
         except Exception as exc:
             self._log(f"Failed to start listener: {exc}")
             messagebox.showerror("Start Failed", str(exc))
@@ -404,6 +552,7 @@ class UEGapGui:
         """Stop packet listener."""
         try:
             self.listener.stop_listening()
+            self.zmq_listener.stop_listening()
             self.status_var.set("Stopped")
             self._log("Listener stopped")
         except Exception as exc:
@@ -451,7 +600,7 @@ class UEGapGui:
             
             # Refresh display with newly filtered packets
             self._populate_packet_list()
-            all_packets = self.listener.get_packets()
+            all_packets = self._active_listener.get_packets()
             self._log(f"Filter applied: capturing {len(all_packets)} packets")
         except Exception as exc:
             self._log(f"Filter failed: {exc}")
@@ -474,7 +623,7 @@ class UEGapGui:
     def _populate_packet_list(self, packets=None):
         """Populate the packet treeview."""
         if packets is None:
-            packets = self.listener.get_packets()
+            packets = self._active_listener.get_packets()
         
         self.packet_tree.delete(*self.packet_tree.get_children())
         
@@ -482,6 +631,7 @@ class UEGapGui:
             release_val = meta.get("contains_release_signal")
             release_str = "Yes" if release_val is True else "No" if release_val is False else "?"
             ngap_str = "Yes" if meta.get("is_ngap") else "No"
+            message_name = meta.get("message_name") or "-"
             
             values = (
                 meta.get("datetime", ""),
@@ -492,14 +642,18 @@ class UEGapGui:
                 str(meta.get("dst_port") or "N/A"),
                 str(meta.get("payload_size", 0)),
                 ngap_str,
+                message_name,
                 release_str,
             )
-            self.packet_tree.insert("", tk.END, values=values)
+            tag = ("ngap",) if meta.get("is_ngap") else ()
+            self.packet_tree.insert("", tk.END, values=values, tags=tag)
+        
+        self.packet_tree.tag_configure("ngap", foreground="green")
     
     def _clear_packets(self):
         """Clear all captured packets."""
         if messagebox.askyesno("Confirm", "Clear all captured packets?"):
-            self.listener.clear_packets()
+            self._active_listener.clear_packets()
             self._populate_packet_list([])
             self.packet_count_var.set("0")
             self._log("All packets cleared")
@@ -509,17 +663,13 @@ class UEGapGui:
         def update_worker():
             while True:
                 try:
-                    # Get filtered packets (already filtered during capture)
-                    captured_packets = self.listener.get_packets()
+                    captured_packets = self._active_listener.get_packets()
                     self.packet_count_var.set(str(len(captured_packets)))
-                    
-                    # Display filtered packets
                     self._populate_packet_list(captured_packets)
-                    
                     self.root.after(500)
                 except Exception:
                     pass
-        
+
         update_thread = threading.Thread(target=update_worker, daemon=True)
         update_thread.start()
     
@@ -529,6 +679,7 @@ class UEGapGui:
             self.root.mainloop()
         finally:
             self.listener.stop_listening()
+            self.zmq_listener.stop_listening()
 
 
 def main():
