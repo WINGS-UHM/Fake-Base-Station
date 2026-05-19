@@ -1,4 +1,5 @@
 import ipaddress
+import json
 import threading
 import tkinter as tk
 import socket
@@ -287,7 +288,7 @@ class ZmqPacketListener:
             try:
                 while not self._stop_event.is_set():
                     try:
-                        raw = self._socket.recv()
+                        raw = self._socket.recv_multipart()
                     except zmq.Again:
                         continue  # timeout, check stop_event
                     self._handle_message(raw)
@@ -298,9 +299,31 @@ class ZmqPacketListener:
         self._thread = threading.Thread(target=_worker, daemon=True)
         self._thread.start()
 
-    def _handle_message(self, raw: bytes):
-        message_name = _extract_message_name(raw)
-        release_signal = _detect_release_signal(raw)
+    def _handle_message(self, frames):
+        """Process a received ZMQ multipart message.
+
+        Expects two frames:
+          frames[0]: JSON metadata {"message_name": ..., "contains_release_signal": ...}
+          frames[1]: raw NGAP bytes
+
+        Falls back to single-frame (raw bytes only) for backwards compatibility.
+        """
+        if len(frames) == 2:
+            try:
+                override = json.loads(frames[0].decode())
+            except Exception:
+                override = {}
+            raw = frames[1]
+        else:
+            override = {}
+            raw = frames[0]
+
+        # Use overridden name from sender if present, else decode from bytes
+        message_name = override.get("message_name") or _extract_message_name(raw)
+        release_signal = override.get("contains_release_signal")
+        if release_signal is None:
+            release_signal = _detect_release_signal(raw)
+
         ts = datetime.now()
         meta = {
             "timestamp": ts.timestamp(),

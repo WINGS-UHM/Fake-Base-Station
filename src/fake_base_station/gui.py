@@ -1,4 +1,5 @@
 import ipaddress
+import json
 import threading
 import tkinter as tk
 import socket
@@ -273,10 +274,14 @@ class ModifiedPcapReplayer:
 
     def replay_to_zmq(self, endpoint: str, on_packet_sent=None):
         """Send raw NGAP payloads over a ZMQ PUSH socket.
-        
-        Extracts the NGAP bytes from each packet and pushes them to `endpoint`
-        so the UE Listener (bound as PULL) can receive and decode them directly
-        without needing SCTP kernel support or radio hardware.
+
+        Each message is sent as a two-frame multipart message:
+          Frame 0: JSON metadata {"message_name": ..., "contains_release_signal": ...}
+          Frame 1: raw NGAP payload bytes
+
+        This lets the UE Listener display the *overridden* message name set in
+        the gNB GUI (e.g. UEContextReleaseCommand) rather than re-decoding the
+        original bytes, which would give the original message.
 
         Args:
             endpoint: ZMQ endpoint, e.g. "tcp://127.0.0.1:5555"
@@ -296,12 +301,17 @@ class ModifiedPcapReplayer:
         try:
             for pkt_dict in self.packets:
                 packet = pkt_dict["packet"]
-                # Extract raw NGAP payload bytes so the receiver can decode directly
                 ngap_bytes = _extract_ngap_payload(packet)
                 if ngap_bytes is None:
-                    # Fall back to full packet bytes if no NGAP layer found
                     ngap_bytes = bytes(packet)
-                sock.send(ngap_bytes)
+
+                # Carry overridden metadata set by the user in the GUI
+                meta_frame = json.dumps({
+                    "message_name": pkt_dict.get("message_name"),
+                    "contains_release_signal": pkt_dict.get("contains_release_signal"),
+                }).encode()
+
+                sock.send_multipart([meta_frame, ngap_bytes])
                 if on_packet_sent:
                     on_packet_sent(pkt_dict.get("index", 0), len(ngap_bytes))
         finally:
@@ -776,6 +786,9 @@ class NGAPPcapGui(tk.Tk):
                     "index": idx,
                     "packet": meta["packet"].copy(),
                     "dst_ip": new_dst_ip,
+                    # Carry user-modified metadata so ZMQ relay can send the overridden values
+                    "message_name": meta.get("message_name"),
+                    "contains_release_signal": meta.get("contains_release_signal"),
                 }
                 packets_to_replay.append(pkt_dict)
 
